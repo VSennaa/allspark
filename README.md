@@ -2,7 +2,7 @@
 
 ⚠️ **STATUS: EM DESENVOLVIMENTO ATIVO**
 
-Este projeto enfrenta atualmente desafios críticos de ruído espectral e desincronia de fase na demodulação via software. As soluções estão sendo iteradas e validadas semanalmente.
+Este projeto enfrenta atualmente desafios críticos de ruído espectral e desincronia de fase na demodulação via software. As soluções estão sendo iteradas e validadas periodicamente.
 
 Este repositório centraliza os algoritmos, firmwares e protocolos para as três frentes de comunicação do projeto CubeSat/ManchaSat:
 
