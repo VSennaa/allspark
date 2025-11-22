@@ -77,4 +77,4 @@ Sistema: **ESP32 WROOM** + **RFM69W/RFM65W 433 MHz**
 
 ---
 
-Desenvolvido como parte da **Iniciação Científica / Projeto ManchaSat**.
+Desenvolvido como parte do **Projeto Allspark CubeSat**.
