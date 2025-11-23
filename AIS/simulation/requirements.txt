@@ -1,0 +1,14 @@
+# Minimal requirements for the AIS simulation / Pluto scripts
+numpy>=1.23
+# The latest pyadi-iio version available on PyPI at the time of writing is 0.0.20.
+# pip failed because there is no pyadi-iio>=0.3.0 on PyPI. Use the PyPI latest
+# or install the up-to-date version directly from the project's GitHub repo.
+pyadi-iio>=0.0.20
+
+# If you need a newer pyadi-iio not published on PyPI, install from GitHub:
+# pip install git+https://github.com/analogdevicesinc/pyadi-iio
+
+# Notes: `pyadi-iio` requires system libraries (libiio, device drivers, etc.)
+# to talk to ADI devices (PlutoSDR). On Debian/Ubuntu you may need to install
+# appropriate packages (example):
+# sudo apt update && sudo apt install libiio-utils libiio-dev libad9361-dev
