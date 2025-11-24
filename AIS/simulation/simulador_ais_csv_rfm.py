@@ -1,147 +1,86 @@
-import time
-import numpy as np
-import adi
+import serial
 import sys
+import time
 import csv
-import os
 
 # --- CONFIGURAÇÕES ---
-PLUTO_IP = "ip:192.168.2.1"
-CENTER_FREQ = 433800000      # 433.8 MHz
-SAMPLE_RATE = 2400000        # 2.4 MSPS
-TX_GAIN = -10                # Ganho moderado
-BAUD_RATE = 9600
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUD_RATE = 115200
+FILENAME = "rfm69_bitstream_log.csv"  # Nome ajustado para refletir bits
 
-TX_BUFFER_SIZE = 2**20       # Buffer cíclico (~0.43s)
-
-# Arquivo CSV para salvar dados
-CSV_FILENAME = os.path.join(os.path.dirname(__file__), "ais_tx_data.csv")
-
-print(f"--- TRANSMISSOR AIS CÍCLICO (HARDWARE LOOP) ---")
-print(f"Conectando ao Pluto em {PLUTO_IP}...")
+print(f"--- LOGGER DE BITS RFM69 (ALTA VELOCIDADE) ---")
+print(f"Conectando na {SERIAL_PORT} com {BAUD_RATE} baud...")
+print(f"Salvando dados em: {FILENAME}")
 
 try:
-    sdr = adi.Pluto(PLUTO_IP)
-    sdr.sample_rate = int(SAMPLE_RATE)
-    sdr.tx_lo = int(CENTER_FREQ)
-    sdr.tx_hardwaregain_chan0 = int(TX_GAIN)
-    sdr.tx_rf_bandwidth = int(SAMPLE_RATE)
-    sdr.tx_cyclic_buffer = True
+    # Conexão serial padrão (Linux gerencia buffer automaticamente)
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    ser.reset_input_buffer()
+    print(">> Conexão Serial estabelecida.")
 except Exception as e:
-    print(f"[ERRO] Falha ao conectar: {e}")
+    print(f"[ERRO CRÍTICO] Erro Serial: {e}")
+    print(f"Dica: sudo chmod 666 {SERIAL_PORT}")
     sys.exit(1)
 
-
-# --- GERAÇÃO DO PACOTE ---
-def generate_packet_bits():
-    mmsi = 123456789
-    payload = [0,0,0,0,0,1, 0,0] + [int(b) for b in f"{mmsi:030b}"] + [0]*130
-
-    # CRC
-    crc = 0xFFFF
-    for b in payload:
-        bit = b & 1
-        xor_flag = (crc >> 15) & 1
-        crc = (crc << 1) & 0xFFFF
-        if xor_flag ^ bit: crc ^= 0x1021
-    crc = ~crc & 0xFFFF 
-
-    data = payload + [int(b) for b in f"{crc:016b}"]
-
-    # Bit Stuffing
-    stuffed = []
-    ones = 0
-    for b in data:
-        stuffed.append(b)
-        if b == 1: ones += 1
-        else: ones = 0
-        if ones == 5: stuffed.append(0); ones = 0
-
-    # Preâmbulo + Flag
-    preamble = [0,1]*32
-    flag = [0,1,1,1,1,1,1,0]
-
-    return preamble + flag + stuffed + flag
-
-
-# --- MODULAÇÃO GMSK ---
-def modulate(bits):
-    # NRZI Encode
-    enc = []
-    state = 1
-    for b in bits:
-        if b == 0: state = 1 - state
-        enc.append(state)
-
-    # Símbolos + Upsampling
-    sym = np.array([2*b-1 for b in enc])
-    sps = int(SAMPLE_RATE/BAUD_RATE)
-    up = np.repeat(sym, sps)
-
-    # Filtro Gaussiano
-    t = np.arange(-4*sps, 4*sps)
-    sigma = np.sqrt(np.log(2)) / (2*np.pi*0.4/sps)
-    g = np.exp(-0.5*(t/sigma)**2); g /= np.sum(g)
-    freq = np.convolve(up, g, 'same')
-
-    # Integração -> fase
-    phase = np.cumsum(freq) * (np.pi / sps * 0.5)
-    iq = np.exp(1j * phase).astype(np.complex64)
-
-    # Tom Wake-up (10ms)
-    tone_len = int(SAMPLE_RATE*0.01)
-    tone = np.exp(1j*2*np.pi*2400*np.arange(tone_len)/SAMPLE_RATE).astype(np.complex64)*0.5
-
-    # Monta buffer final
-    packet_signal = np.concatenate([tone, iq])
-
-    if len(packet_signal) > TX_BUFFER_SIZE:
-        final_buffer = packet_signal[:TX_BUFFER_SIZE]
-    else:
-        padding = np.zeros(TX_BUFFER_SIZE - len(packet_signal), dtype=np.complex64)
-        final_buffer = np.concatenate([packet_signal, padding])
-
-    return final_buffer * 2**14
-
-
-# --- EXECUÇÃO ---
-print("Gerando forma de onda...")
-bits = generate_packet_bits()
-iq_buffer = modulate(bits)
-
-print(f"Carregando buffer no Pluto ({len(iq_buffer)} amostras)...")
-sdr.tx(iq_buffer)
-
-# --- SALVA CSV ---
-print(f"Salvando dados do pacote em {CSV_FILENAME} ...")
-with open(CSV_FILENAME, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["timestamp", "bit"])
-    ts = time.time()
-    for b in bits:
-        writer.writerow([ts, b])
-
-print("\n✅ TRANSMISSÃO ATIVA!")
-print(f"Frequência: {CENTER_FREQ/1e6} MHz")
-print("O pacote está sendo repetido continuamente pelo hardware do Pluto.")
-print("Pressione CTRL+C para parar.\n")
+line_count = 0
+start_time = time.time()
 
 try:
-    while True:
-        time.sleep(1)
+    with open(FILENAME, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Timestamp_Epoch", "Bit_Value", "Raw_Line"])
+
+        print(">> Capturando... (Pressione CTRL+C para parar e salvar)")
+
+        last_flush = time.time()
+        total_lines = 0
+
+        while True:
+            try:
+                line_bytes = ser.readline()
+            except Exception:
+                time.sleep(0.01)
+                continue
+
+            if not line_bytes:
+                time.sleep(0.0001)
+                continue
+
+            ts = time.time()
+            total_lines += 1
+
+            raw_line = line_bytes.decode('latin-1', errors='replace').strip()
+
+            bit_val = raw_line if raw_line in ('0', '1') else ''
+            if bit_val:
+                line_count += 1
+
+            try:
+                writer.writerow([f"{ts:.6f}", bit_val, raw_line])
+            except Exception:
+                pass
+
+            now = time.time()
+            if (line_count % 2000 == 0 and line_count > 0) or (now - last_flush) > 1.0:
+                try:
+                    csvfile.flush()
+                except Exception:
+                    pass
+                last_flush = now
+
+            if line_count % 2000 == 0 and line_count > 0:
+                elapsed = time.time() - start_time
+                rate = line_count / elapsed if elapsed > 0 else 0
+                print(f"\rCapturados: {line_count} bits ({rate:.0f} bits/s)", end="")
+            
+
 except KeyboardInterrupt:
-    print("\nParando TX...")
-
-    # 1. Destrói buffer cíclico
-    if hasattr(sdr, "tx_destroy_buffer"):
-        sdr.tx_destroy_buffer()  # forma oficial
-    else:
-        # fallback manual
-        sdr._tx_cyclic_buffer = False
-
-    # 2. Opcional: limpar TX enviando zeros
-    sdr.tx(np.zeros(1024, dtype=np.complex64))
-
-    # 3. Deleta SDR
-    del sdr
-    print("Transmissão encerrada com segurança.")
+    print(f"\n\n--- Finalizando... ---")
+    try:
+        if ser.is_open:
+            ser.close()
+        print(f"Arquivo '{FILENAME}' salvo com sucesso.")
+        print(f"Total de bits capturados: {line_count}")
+    except Exception as e:
+        print(f"Erro ao fechar: {e}")
+    sys.exit(0)
