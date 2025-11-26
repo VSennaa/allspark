@@ -222,26 +222,40 @@ def camera_loop():
     global frame_raw, lock
     print("Iniciando câmera...")
     
-    # Tenta conectar na câmera 0. Se falhar, tenta a 1.
-    cap = cv2.VideoCapture(0)
+    # Define o backend correto para evitar erro do GStreamer
+    backend = cv2.CAP_V4L2
+    
+    # Tenta conectar na câmera 0 com o backend V4L2
+    cap = cv2.VideoCapture(0, backend)
+    
     if not cap.isOpened():
         print("Câmera 0 falhou. Tentando Câmera 1...")
-        cap = cv2.VideoCapture(1)
+        cap = cv2.VideoCapture(1, backend)
     
-    # Configura resolução de hardware (Importante para o Pi Zero)
-    cap.set(3, 800)
-    cap.set(4, 600)
+    # --- CONFIGURAÇÕES CRÍTICAS PARA CÂMERA Jieli/HBVCAM ---
+    # 1. Força o formato MJPEG (evita travamentos e erros de buffer)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+    
+    # 2. Configura resolução de hardware direto para 640x480
+    # Isso elimina a necessidade de fazer cv2.resize depois (economiza CPU)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
     
     while True:
         ret, frame = cap.read()
         if ret:
             with lock:
-                # Resize para 640x480 para transmissão leve
-                frame_raw = cv2.resize(frame, (640, 480))
+                # O frame já vem em 640x480 do hardware, não precisa de resize
+                frame_raw = frame
         else:
             print("Erro de leitura da câmera (tentando reconectar...)")
             time.sleep(2)
-            cap.open(0) # Tenta reabrir
+            # Ao reconectar, precisamos passar o backend e reconfigurar o MJPEG
+            cap.open(0, backend)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             
         time.sleep(0.04) # ~25 FPS
 
@@ -388,4 +402,5 @@ if __name__ == '__main__':
     print("=========================================\n")
     
     # Roda Servidor Flask
+
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
