@@ -1,3 +1,6 @@
+# app.py
+# Caminho sugerido: ./app.py
+
 import cv2
 import time
 import threading
@@ -52,25 +55,19 @@ def apply_clahe(image):
         return image
 
 def verificar_borda(cnt, width, height, margin=5):
-    """
-    Retorna True se o objeto estiver tocando a borda do recorte (ignora moldura).
-    """
     x, y, w, h = cv2.boundingRect(cnt)
     toca_topo = (y <= margin)
     toca_fundo = (y + h >= height - margin)
     toca_esq = (x <= margin)
     toca_dir = (x + w >= width - margin)
-    
     if toca_topo or toca_fundo or toca_esq or toca_dir:
         return True
     return False
 
 def desenhar_pontos_traco(img, cnt):
-    """ Desenha coordenadas ao longo de um traço. """
     peri = cv2.arcLength(cnt, True)
     approx = cv2.approxPolyDP(cnt, 0.01 * peri, False)
     pontos = approx.reshape(-1, 2)
-    
     if len(pontos) > SKELETON_SAMPLING:
         indices = np.linspace(0, len(pontos) - 1, SKELETON_SAMPLING).astype(int)
         pontos_para_desenhar = pontos[indices]
@@ -78,61 +75,122 @@ def desenhar_pontos_traco(img, cnt):
         pontos_para_desenhar = pontos
 
     for point in pontos_para_desenhar:
-        px, py = point
+        px, py = int(point[0]), int(point[1])
         cv2.circle(img, (px, py), 3, (0, 255, 255), -1)
-        texto = f"{px},{py}"
-        tx, ty = px + 5, py - 5
-        h, w = img.shape[:2]
-        if tx > w - 50: tx = px - 50
-        if ty < 15: ty = py + 15
-        cv2.putText(img, texto, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
+
+def _choose_label_position(img_w, img_h, bbox, text_w, text_h, margin=10):
+    """
+    Tenta posicionar o rótulo fora de bbox na ordem: direita, esquerda, topo, fundo.
+    Retorna (label_x, label_y) top-left do texto.
+    bbox = (x_min, y_min, x_max, y_max)
+    """
+    x_min, y_min, x_max, y_max = bbox
+
+    # direita
+    lx = x_max + margin
+    ly = y_min
+    if lx + text_w + margin < img_w:
+        ly = max(margin, min(ly, img_h - text_h - margin))
+        return int(lx), int(ly)
+
+    # esquerda
+    lx = x_min - margin - text_w
+    ly = y_min
+    if lx > margin:
+        ly = max(margin, min(ly, img_h - text_h - margin))
+        return int(lx), int(ly)
+
+    # acima
+    lx = x_min
+    ly = y_min - margin - text_h
+    if ly > margin:
+        lx = max(margin, min(lx, img_w - text_w - margin))
+        return int(lx), int(ly)
+
+    # abaixo
+    lx = x_min
+    ly = y_max + margin
+    if ly + text_h + margin < img_h:
+        lx = max(margin, min(lx, img_w - text_w - margin))
+        return int(lx), int(ly)
+
+    # fallback: canto superior direito com margem
+    return int(img_w - text_w - margin), int(margin)
 
 def desenhar_indicador(img, cnt, area, circularity, tipo):
     """
-    Desenha o indicador e calcula a ÁREA RELATIVA (%)
+    Desenha o indicador e posiciona o rótulo FORA da caixa que envolve o contorno.
     """
-    # 1. CÁLCULO DA ÁREA RELATIVA
-    h_roi, w_roi = img.shape[:2]
-    area_total_roi = h_roi * w_roi
-    
-    pct_area = 0.0
-    if area_total_roi > 0:
-        pct_area = (area / area_total_roi) * 100
-        
-    color = (0, 0, 255) 
-    cx, cy = 0, 0
-    label_offset_y = 0
+    h_img, w_img = img.shape[:2]
+    area_total_roi = h_img * w_img
+    pct_area = (area / area_total_roi) * 100 if area_total_roi > 0 else 0.0
 
+    color = (0, 0, 255)  # default vermelho
+    cx, cy = 0, 0
+    label_text = ""
+    margin = 10
+    # Determinar bbox (x_min,y_min,x_max,y_max) referente ao contorno desenhado
     if tipo == "TRACO":
         rect = cv2.minAreaRect(cnt)
         box = cv2.boxPoints(rect)
         box = np.int64(box)
         cv2.drawContours(img, [box], 0, color, 2)
         cx, cy = int(rect[0][0]), int(rect[0][1])
-        label_offset_y = -20
+        # bbox a partir do box
+        xs = box[:,0]; ys = box[:,1]
+        x_min, x_max = int(xs.min()), int(xs.max())
+        y_min, y_max = int(ys.min()), int(ys.max())
+        # desenhar pontos internos (esqueleto) sem texto
         desenhar_pontos_traco(img, cnt)
     else:
         (x, y), radius = cv2.minEnclosingCircle(cnt)
         center = (int(x), int(y))
         radius = int(radius)
-        if tipo == "NAVIO": color = (255, 200, 0) 
+        if tipo == "NAVIO":
+            color = (255, 200, 0)
         cv2.circle(img, center, radius + 5, color, 2)
         cx, cy = int(x), int(y)
-        label_offset_y = -(radius + 10)
+        x_min = cx - (radius + 5)
+        x_max = cx + (radius + 5)
+        y_min = cy - (radius + 5)
+        y_max = cy + (radius + 5)
 
-    label_x = cx + 30
-    label_y = cy + label_offset_y
-    h_img, w_img = img.shape[:2]
-    label_x = min(label_x, w_img - 220) # Aumentei margem pq o texto ficou maior
-    label_y = max(label_y, 30)
-    label_y = min(label_y, h_img - 10)
-    
-    cv2.line(img, (cx, cy), (label_x - 5, label_y + 5), color, 1)
-    
-    # TEXTO ATUALIZADO COM %
-    text = f"{tipo} {pct_area:.2f}% (px:{int(area)})"
-    
-    cv2.putText(img, text, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    # Preparar texto: tipo, percentual e coordenadas (centro)
+    label_text = f"{tipo} {pct_area:.2f}% (px:{int(area)})"
+    coord_text = f"({cx},{cy})"
+    # medir tamanhos de texto
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    thickness = 1
+    (tw, th), _ = cv2.getTextSize(label_text, font, font_scale, thickness)
+    (cw, ch), _ = cv2.getTextSize(coord_text, font, font_scale, thickness)
+
+    # escolher posição para o bloco de texto (colocamos label_text e abaixo coord_text)
+    total_h = th + 4 + ch
+    total_w = max(tw, cw)
+    bbox = (x_min, y_min, x_max, y_max)
+    label_x, label_y = _choose_label_position(w_img, h_img, bbox, total_w, total_h, margin=margin)
+
+    # desenhar linha do centro até ponto mais próximo do rótulo
+    # calcular ponto de ligação (pegamos o centro do bbox)
+    box_cx = int((x_min + x_max) / 2)
+    box_cy = int((y_min + y_max) / 2)
+    # conectar centro real (cx,cy) com ponto médio da borda do rótulo
+    text_anchor_x = label_x
+    text_anchor_y = label_y + int(total_h / 2)
+    cv2.line(img, (cx, cy), (text_anchor_x - 5 if text_anchor_x > cx else text_anchor_x + total_w + 5, text_anchor_y), color, 1)
+
+    # desenhar retângulo leve de fundo para texto (melhora legibilidade)
+    rect_bg_pt1 = (label_x - 4, label_y - 2)
+    rect_bg_pt2 = (label_x + total_w + 4, label_y + total_h + 2)
+    overlay = img.copy()
+    cv2.rectangle(overlay, rect_bg_pt1, rect_bg_pt2, (0,0,0), -1)
+    alpha = 0.45
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+    # desenhar textos: primeiro label, depois coordenadas em linha abaixo
+    cv2.putText(img, label_text, (label_x, label_y + th), font, font_scale, color, thickness, cv2.LINE_AA)
+    cv2.putText(img, coord_text, (label_x, label_y + th + 4 + ch), font, font_scale, (200,200,200), thickness, cv2.LINE_AA)
 
 def processar_frame(frame, mode='DETECT'):
     global MIN_AREA, INVERTED_THRESH, MAX_OIL_AREA, SHIP_CIRCULARITY_THRESH
@@ -415,20 +473,15 @@ HTML_INDEX = """
     </div>
 
     <script>
-        // ------------------------------------------
-        // AUTOMAÇÃO: CONTA 5 SEGUNDOS E DISPARA
-        // ------------------------------------------
         window.onload = function() {
             let countdown = 5;
             const display = document.getElementById('mode_display');
-            
             const timer = setInterval(() => {
                 display.innerText = "AUTO-START: " + countdown + "s";
                 countdown--;
-                
                 if (countdown < 0) {
                     clearInterval(timer);
-                    triggerAuto(); // Chama a função de detecção automaticamente
+                    triggerAuto();
                 }
             }, 1000);
         };
@@ -438,7 +491,6 @@ HTML_INDEX = """
         function triggerAuto() { 
             document.getElementById('mode_display').innerText = "BUSCANDO...";
             fetch('/trigger_auto_crop').then(r=>r.text()).then(msg => { 
-                // Se falhar, mostra erro, mas não usa alert para não travar automação futura
                 if(msg.includes("Falha")) {
                      document.getElementById('mode_display').innerText = "FALHA AUTO (USE MANUAL)";
                 } else {
