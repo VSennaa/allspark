@@ -1,0 +1,372 @@
+import cv2
+import time
+import threading
+import numpy as np
+import statistics
+from flask import Flask, Response, render_template_string, request
+
+# ============================================================================
+# 1. VARIÁVEIS GLOBAIS E CONFIGURAÇÕES
+# ============================================================================
+frame_raw = None      
+frame_output = None   
+lock = threading.Lock()
+app = Flask(__name__)
+
+# --- Estados do Sistema ---
+CURRENT_MODE = 'RAW' 
+FLIP_CAMERA = False 
+
+# --- Configurações de Recorte (ROI) ---
+ROI_TOP, ROI_BOTTOM = 0.0, 1.0
+ROI_LEFT, ROI_RIGHT = 0.0, 1.0
+
+# --- Parâmetros de Ajuste ---
+GAMMA_VALUE = 1.0
+
+# Limiar de Inversão: Quanto mais alto, mais "preto puro" o objeto precisa ser.
+INVERTED_THRESH = 160 
+
+# Sensibilidade de Área
+MIN_AREA = 2          
+
+# Se for maior que isso E for redondo, é Navio.
+# Se for menor que isso, é óleo mesmo se for redondo.
+MAX_OIL_AREA = 200  
+
+# NOVO: Limiar de Circularidade (0.0 a 1.0)
+# Navios são círculos perfeitos (~0.9+). Rastros são alongados (<0.8).
+SHIP_CIRCULARITY_THRESH = 0.82
+
+# ============================================================================
+# 2. INTELIGÊNCIA (Processamento de Imagem)
+# ============================================================================
+
+def adjust_gamma(image, gamma=1.0):
+    if gamma == 1.0: return image
+    invGamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+    return cv2.LUT(image, table)
+
+def apply_clahe(image):
+    try:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        cl = clahe.apply(l)
+        limg = cv2.merge((cl, a, b))
+        return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    except:
+        return image
+
+def desenhar_indicador_oleo(img, cnt, area, circularity):
+    (x, y), radius = cv2.minEnclosingCircle(cnt)
+    center = (int(x), int(y))
+    radius = int(radius)
+    color = (0, 0, 255) # Vermelho
+    
+    cv2.circle(img, center, radius + 5, color, 2)
+    
+    label_x = int(x) + radius + 10
+    label_y = int(y) - radius - 10
+    h_img, w_img = img.shape[:2]
+    label_x = min(label_x, w_img - 200)
+    label_y = max(label_y, 20)
+    cv2.line(img, (int(x), int(y) - radius - 5), (label_x - 5, label_y + 5), color, 1)
+    
+    # Mostra a circularidade no label para ajudar a calibrar
+    text = f"OLEO {int(area)}px (Circ:{circularity:.2f})"
+    cv2.putText(img, text, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+def processar_frame(frame, mode='DETECT'):
+    global MIN_AREA, INVERTED_THRESH, MAX_OIL_AREA, SHIP_CIRCULARITY_THRESH
+    
+    if frame is None: return None
+
+    # 1. Recorte (ROI)
+    height, width = frame.shape[:2]
+    y1, y2 = int(height * ROI_TOP), int(height * ROI_BOTTOM)
+    x1, x2 = int(width * ROI_LEFT), int(width * ROI_RIGHT)
+    if y2 > y1 and x2 > x1: roi = frame[y1:y2, x1:x2]
+    else: roi = frame
+
+    # 2. Pré-processamento
+    roi = apply_clahe(roi)
+    roi = adjust_gamma(roi, GAMMA_VALUE)
+
+    # 3. Inversão e Binarização
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    inverted = cv2.bitwise_not(gray)
+    _, binary = cv2.threshold(inverted, INVERTED_THRESH, 255, cv2.THRESH_BINARY)
+    
+    # 4. Dilatação (Engordar rastros para conectá-los)
+    # Isso torna 3 bolinhas alinhadas em 1 "salsicha" (baixa circularidade)
+    kernel = np.ones((3,3), np.uint8)
+    binary = cv2.dilate(binary, kernel, iterations=2) 
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    if mode == 'DEBUG': 
+        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    # 5. Análise
+    contours, _ = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    output_view = roi.copy()
+
+    oleo_detectado = False
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < MIN_AREA: continue 
+
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0: continue
+        
+        # CÁLCULO DE CIRCULARIDADE
+        # 1.0 = Círculo Perfeito. < 0.7 = Alongado/Irregular
+        circularity = 4 * np.pi * (area / (perimeter * perimeter))
+        
+        # --- LÓGICA GEOMÉTRICA ---
+        
+        # Caso 1: É muito redondo? (Pode ser Navio ou Gota isolada)
+        if circularity >= SHIP_CIRCULARITY_THRESH:
+            if area > MAX_OIL_AREA:
+                # Redondo E Grande = Navio
+                cv2.drawContours(output_view, [cnt], -1, (255, 200, 0), 2)
+                cv2.putText(output_view, f"NAVIO (C:{circularity:.2f})", 
+                            (int(cnt[0][0][0]), int(cnt[0][0][1])), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1)
+            else:
+                # Redondo mas Pequeno = Gota de Óleo
+                if not oleo_detectado:
+                    desenhar_indicador_oleo(output_view, cnt, area, circularity)
+                    oleo_detectado = True
+                else:
+                    cv2.drawContours(output_view, [cnt], -1, (0, 0, 255), 1)
+        
+        # Caso 2: Não é redondo (Irregular/Alongado) -> É ÓLEO (Rastro)
+        else:
+            if not oleo_detectado:
+                desenhar_indicador_oleo(output_view, cnt, area, circularity)
+                oleo_detectado = True
+            else:
+                 cv2.drawContours(output_view, [cnt], -1, (0, 0, 255), 1)
+
+    cv2.putText(output_view, f"Circ Thresh: {SHIP_CIRCULARITY_THRESH} | Thresh: {INVERTED_THRESH}", (10, height - 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    return output_view
+
+def detectar_canvas_retangular(img):
+    global ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 30, 100)
+    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+    screen_cnt = None
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            screen_cnt = approx
+            break
+    if screen_cnt is not None:
+        x, y, w, h = cv2.boundingRect(screen_cnt)
+        h_img, w_img = img.shape[:2]
+        if w * h > (w_img * h_img * 0.1):
+            margin_x = int(w * 0.04)
+            margin_y = int(h * 0.04)
+            x_new = x + margin_x
+            y_new = y + margin_y
+            w_new = w - (2 * margin_x)
+            h_new = h - (2 * margin_y)
+            ROI_LEFT = max(0.0, x_new / w_img)
+            ROI_TOP = max(0.0, y_new / h_img)
+            ROI_RIGHT = min(1.0, (x_new + w_new) / w_img)
+            ROI_BOTTOM = min(1.0, (y_new + h_new) / h_img)
+            return True
+    return False
+
+# ============================================================================
+# 3. CÂMERA
+# ============================================================================
+def camera_loop():
+    global frame_raw, frame_output, ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT
+    backend = cv2.CAP_V4L2
+    cap = cv2.VideoCapture(0, backend)
+    if not cap.isOpened(): cap = cv2.VideoCapture(1, backend)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            with lock: frame_raw = frame
+            if FLIP_CAMERA: frame = cv2.flip(frame, -1)
+            if CURRENT_MODE == 'RAW': frame_output = frame
+            elif CURRENT_MODE == 'DETECT': frame_output = processar_frame(frame, mode='DETECT')
+            elif CURRENT_MODE == 'DEBUG': frame_output = processar_frame(frame, mode='DEBUG')
+        else:
+            time.sleep(2)
+            cap.open(0, backend)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        time.sleep(0.01)
+
+# ============================================================================
+# 4. ROTAS E INTERFACE
+# ============================================================================
+def gerar_frames():
+    global frame_output
+    while True:
+        with lock:
+            if frame_output is None:
+                img = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(img, "AGUARDANDO CAMERA...", (150, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                out = img
+            else: out = frame_output
+            flag, encoded = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+            if not flag: continue
+        yield(b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + bytearray(encoded) + b'\r\n')
+        time.sleep(0.05)
+
+@app.route("/")
+def index(): return render_template_string(HTML_INDEX)
+
+@app.route("/video_stream")
+def video_stream(): return Response(gerar_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/set_mode/<mode>")
+def set_mode(mode):
+    global CURRENT_MODE
+    if mode in ['RAW', 'DETECT', 'DEBUG']:
+        with lock: CURRENT_MODE = mode
+    return "OK"
+
+@app.route("/trigger_detect")
+def trigger_detect():
+    global FLIP_CAMERA, CURRENT_MODE
+    with lock:
+        FLIP_CAMERA = True 
+        if frame_raw is not None:
+            frame_flipped = cv2.flip(frame_raw, -1)
+            detectar_canvas_retangular(frame_flipped)
+        CURRENT_MODE = 'DETECT'
+    return "Detecção Iniciada!"
+
+@app.route("/update_params", methods=['POST'])
+def update_params():
+    global GAMMA_VALUE, INVERTED_THRESH, MAX_OIL_AREA, SHIP_CIRCULARITY_THRESH
+    data = request.json
+    GAMMA_VALUE = float(data['gamma'])
+    INVERTED_THRESH = int(data['inverted_thresh'])
+    MAX_OIL_AREA = int(data['max_oil_area'])
+    SHIP_CIRCULARITY_THRESH = float(data['ship_circ'])
+    return "OK"
+
+@app.route("/reset_view")
+def reset_view():
+    global ROI_TOP, ROI_BOTTOM, ROI_LEFT, ROI_RIGHT, CURRENT_MODE, FLIP_CAMERA
+    with lock:
+        ROI_TOP, ROI_LEFT, ROI_BOTTOM, ROI_RIGHT = 0.0, 0.0, 1.0, 1.0
+        CURRENT_MODE = 'RAW'
+        FLIP_CAMERA = False
+    return "Reset OK"
+
+HTML_INDEX = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sistema de Visão Profissional</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { background: #121212; color: #e0e0e0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; margin: 0; }
+        .header { padding: 20px; background: #1f1f1f; border-bottom: 2px solid #333; margin-bottom: 20px; }
+        .container { display: flex; flex-wrap: wrap; justify-content: center; gap: 30px; }
+        .video-container { position: relative; border: 3px solid #333; box-shadow: 0 0 20px rgba(0,0,0,0.5); display: inline-block; }
+        .video-box { display: block; max-width: 100%; height: auto; }
+        .panel { background: #1e1e1e; padding: 20px; border-radius: 10px; width: 300px; text-align: left; border: 1px solid #333; }
+        .btn { width: 100%; padding: 12px; margin: 8px 0; border: none; border-radius: 5px; font-size: 16px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        .btn-primary { background-color: #007bff; color: white; }
+        .btn-primary:hover { background-color: #0056b3; }
+        .btn-danger { background-color: #dc3545; color: white; }
+        .btn-danger:hover { background-color: #a71d2a; }
+        .btn-warning { background-color: #ffc107; color: #212529; }
+        .btn-warning:hover { background-color: #e0a800; }
+        .slider-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-size: 14px; color: #aaa; }
+        input[type=range] { width: 100%; }
+    </style>
+</head>
+<body>
+    <div class="header"><h2>🛰️ SISTEMA DE DETECÇÃO DE ÓLEO</h2></div>
+    <div class="container">
+        <div class="video-container">
+            <img class="video-box" src="/video_stream" width="640" height="480">
+            <div id="status_overlay" style="position:absolute; top:10px; left:10px; color: yellow; font-weight:bold; text-shadow: 1px 1px 2px black;">MODO: <span id="mode_label">AO VIVO</span></div>
+        </div>
+        <div class="panel">
+            <h3 style="border-bottom: 1px solid #444; padding-bottom: 10px;">Comandos</h3>
+            <button class="btn btn-primary" onclick="triggerDetect()">🔍 DETECTAR (Auto)</button>
+            <button class="btn btn-danger" onclick="resetView()">❌ RESETAR / AO VIVO</button>
+            <div style="margin-top: 20px; padding-top:10px; border-top: 1px solid #444;">
+                <h4>Ferramentas</h4>
+                <button class="btn btn-warning" onclick="setMode('DEBUG')">🛠️ Ver Inverso (Debug)</button>
+            </div>
+            <div style="margin-top: 20px;">
+                <h4>Ajustes de Forma</h4>
+                <div class="slider-group">
+                    <label>Gamma (Luz): <span id="val_gamma">1.0</span></label>
+                    <input type="range" id="gamma" min="0.5" max="3.0" step="0.1" value="1.0" oninput="updateParams()">
+                </div>
+                <div class="slider-group">
+                    <label>Limiar Inverso (Preto): <span id="val_thresh">160</span></label>
+                    <input type="range" id="inverted_thresh" min="100" max="254" value="160" oninput="updateParams()">
+                    <small style="color:#666">Maior = Só detecta preto puro</small>
+                </div>
+                <div class="slider-group">
+                    <label>Circularidade Min. Navio: <span id="val_circ">0.82</span></label>
+                    <input type="range" id="ship_circ" min="0.5" max="1.0" step="0.01" value="0.82" oninput="updateParams()">
+                    <small style="color:#666">Navios são círculos perfeitos (~1.0)</small>
+                </div>
+                 <div class="slider-group">
+                    <label>Área Navio vs Gota: <span id="val_area">200</span></label>
+                    <input type="range" id="max_oil_area" min="10" max="1000" value="200" oninput="updateParams()">
+                    <small style="color:#666">Separa navios de gotas redondas</small>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        function setMode(mode) { fetch('/set_mode/' + mode).then(() => { document.getElementById('mode_label').innerText = mode; }); }
+        function triggerDetect() { document.getElementById('mode_label').innerText = "PROCESSANDO..."; fetch('/trigger_detect').then(r => r.text()).then(msg => { alert(msg); document.getElementById('mode_label').innerText = "DETECÇÃO"; }); }
+        function resetView() { fetch('/reset_view').then(() => { document.getElementById('mode_label').innerText = "AO VIVO"; }); }
+        function updateParams() {
+            const params = {
+                gamma: document.getElementById('gamma').value,
+                inverted_thresh: document.getElementById('inverted_thresh').value,
+                max_oil_area: document.getElementById('max_oil_area').value,
+                ship_circ: document.getElementById('ship_circ').value
+            };
+            document.getElementById('val_gamma').innerText = params.gamma;
+            document.getElementById('val_thresh').innerText = params.inverted_thresh;
+            document.getElementById('val_area').innerText = params.max_oil_area;
+            document.getElementById('val_circ').innerText = params.ship_circ;
+            fetch('/update_params', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(params) });
+        }
+    </script>
+</body>
+</html>
+"""
+
+if __name__ == '__main__':
+    t = threading.Thread(target=camera_loop)
+    t.daemon = True
+    t.start()
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+pi@raspberrypi:~ $ ^C
+pi@raspberrypi:~ $ 
+
